@@ -1,0 +1,1056 @@
+-- ================================================================
+-- GARAGE DETECTOR v3.0
+-- Delta Executor | Roblox Portal Sandbox | PC + Mobile
+-- ================================================================
+
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local Camera           = workspace.CurrentCamera
+local LocalPlayer      = Players.LocalPlayer
+local PlayerGui        = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ================================================================
+-- PLATAFORMA
+-- ================================================================
+local IS_MOBILE = UserInputService.TouchEnabled
+                  and not UserInputService.KeyboardEnabled
+
+-- ================================================================
+-- CONFIG
+-- ================================================================
+local CFG = {
+    UPDATE_HZ    = 0.5,
+    GUI_NAME     = "GD_HUD_v3",
+    FAB_NAME     = "GD_FAB_v3",
+    GARAGE_TTL   = 6,   -- seg entre re-scans do workspace
+    DIM_TTL      = 6,
+
+    -- Layout (mobile vs PC)
+    WIN_W        = IS_MOBILE and 320 or 400,
+    WIN_MAX_H    = IS_MOBILE and 480 or 420,
+    HDR_H        = IS_MOBILE and 40  or 32,
+    ROW_H        = IS_MOBILE and 56  or 22,
+    FONT_HDR     = IS_MOBILE and 14  or 12,
+    FONT_ROW     = IS_MOBILE and 11  or 10,
+    BTN_W        = IS_MOBILE and 34  or 22,
+    BTN_H        = IS_MOBILE and 28  or 16,
+    FAB          = IS_MOBILE and 44  or 28,
+    PAD          = IS_MOBILE and 5   or 3,
+    SCROLL_BAR   = IS_MOBILE and 0   or 3,
+}
+
+-- ================================================================
+-- PALETA
+-- ================================================================
+local K = {
+    BG     = Color3.fromRGB(12, 12, 18),
+    HDR    = Color3.fromRGB(20, 20, 32),
+    ROW    = Color3.fromRGB(18, 18, 28),
+    ROW2   = Color3.fromRGB(22, 22, 34),
+    BORDER = Color3.fromRGB(44, 44, 66),
+    TITLE  = Color3.fromRGB(170,130,255),
+    WHITE  = Color3.fromRGB(220,220,220),
+    GRAY   = Color3.fromRGB(110,110,135),
+    GREEN  = Color3.fromRGB( 65,200,100),
+    RED    = Color3.fromRGB(205, 65, 65),
+    YELLOW = Color3.fromRGB(205,185, 55),
+    PURPLE = Color3.fromRGB(165, 85,245),
+    CYAN   = Color3.fromRGB( 65,185,205),
+    CLOSE  = Color3.fromRGB(185, 50, 50),
+    MINI   = Color3.fromRGB(190,155, 40),
+    FAB    = Color3.fromRGB( 80, 50,150),
+}
+
+-- ================================================================
+-- ESTADO GLOBAL
+-- ================================================================
+local registry    = {}   -- [userId] -> dados do jogador
+local rowFrames   = {}   -- [userId] -> { frame, labels{} }
+local conns       = {}   -- RBXScriptConnections globais
+local charConns   = {}   -- [userId] -> CharacterAdded conn
+local minimized   = false
+local guiAlive    = false
+
+local screenGui, mainWin, scrollFrame, rowLayout
+local lblCount, fabGui
+
+-- ================================================================
+-- UTILITÁRIOS GERAIS
+-- ================================================================
+local function safeRead(obj, prop)
+    if not obj then return nil end
+    local ok, v = pcall(function() return obj[prop] end)
+    return ok and v or nil
+end
+
+local function safeCall(fn, ...)
+    local ok, v = pcall(fn, ...)
+    return ok and v or nil
+end
+
+local function fmtXZ(pos)
+    -- exibe só X e Z para economizar espaço; Y separado quando necessário
+    return string.format("%d,%d,%d",
+        math.floor(pos.X), math.floor(pos.Y), math.floor(pos.Z))
+end
+
+local function fmtDist(d)
+    if not d then return "?" end
+    return string.format("%.0f", d)
+end
+
+local function ts()
+    -- timestamp curto
+    return string.format("%02d:%02d", math.floor(tick()/60)%60, math.floor(tick())%60)
+end
+
+-- ================================================================
+-- SCAN DE WORKSPACE — GARAGENS
+-- ================================================================
+-- Cada entrada: { model, owner:string|nil, cf:CFrame, sz:Vector3, name:string }
+local garageCache   = {}
+local garageCacheTS = -999
+
+local GPAT = {"garage","garagem","slot","bay","hangar","parking","carslot","vehicleslot"}
+
+local function nameHitsGarage(n)
+    local low = n:lower()
+    for _, p in ipairs(GPAT) do
+        if low:find(p, 1, true) then return true end
+    end
+    return false
+end
+
+-- Extrai proprietário de um objeto: atributos → StringValue/ObjectValue → padrão no nome
+local function extractOwner(obj)
+    local ATTR = {"Owner","PlayerName","OwnerName","OwnerId","PlayerOwner"}
+    for _, a in ipairs(ATTR) do
+        local ok, v = pcall(function() return obj:GetAttribute(a) end)
+        if ok and type(v)=="string" and #v>0 then return v end
+        if ok and type(v)=="number" then
+            -- pode ser UserId
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p.UserId == v then return p.Name end
+            end
+        end
+    end
+    local ok2, kids = pcall(function() return obj:GetChildren() end)
+    if ok2 then
+        for _, c in ipairs(kids) do
+            local cn = c.ClassName
+            local low = c.Name:lower()
+            if (cn=="StringValue" or cn=="IntValue" or cn=="ObjectValue") and
+               (low=="owner" or low=="playername" or low=="player" or
+                low=="ownername" or low=="ownerid") then
+                local ok3, v = pcall(function()
+                    if cn=="StringValue" then return c.Value
+                    elseif cn=="IntValue" then
+                        for _, p in ipairs(Players:GetPlayers()) do
+                            if p.UserId==c.Value then return p.Name end
+                        end
+                    elseif cn=="ObjectValue" and c.Value then
+                        return c.Value.Name
+                    end
+                end)
+                if ok3 and v and type(v)=="string" and #v>0 then return v end
+            end
+        end
+    end
+    -- Padrão no próprio nome: Garage_Alice, Slot-Bob, PlayerGarage_Charlie
+    local tail = obj.Name:match("[Gg]arage[_%-. ]?(.+)") or
+                 obj.Name:match("[Ss]lot[_%-. ]?(.+)")    or
+                 obj.Name:match("[Pp]arking[_%-. ]?(.+)") or
+                 obj.Name:match("[Pp]layer[_%-. ]?(.+)")
+    if tail and #tail>0 then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p.Name==tail or p.DisplayName==tail then return p.Name end
+        end
+        -- retorna o tail mesmo assim (pode casar mais tarde)
+        return tail
+    end
+    return nil
+end
+
+local function getModelBB(obj)
+    local ok, cf, sz = pcall(function() return obj:GetBoundingBox() end)
+    if ok and cf and sz then return cf, sz end
+    local pp = safeRead(obj,"PrimaryPart")
+    if pp then
+        local pos = safeRead(pp,"Position")
+        if pos then return CFrame.new(pos), Vector3.new(24,12,24) end
+    end
+    -- última tentativa: BasePart direta
+    if obj:IsA("BasePart") then
+        local pos = safeRead(obj,"Position")
+        local sz2 = safeRead(obj,"Size")
+        if pos then
+            return CFrame.new(pos), sz2 or Vector3.new(10,5,10)
+        end
+    end
+    return nil, nil
+end
+
+local function doGarageScan()
+    garageCache   = {}
+    garageCacheTS = tick()
+    local function scan(node, depth)
+        if depth > 4 then return end
+        local ok, kids = pcall(function() return node:GetChildren() end)
+        if not ok then return end
+        for _, obj in ipairs(kids) do
+            local n = safeRead(obj,"Name") or ""
+            if nameHitsGarage(n) then
+                local cf, sz = getModelBB(obj)
+                if cf then
+                    garageCache[#garageCache+1] = {
+                        model = obj,
+                        owner = extractOwner(obj),
+                        cf    = cf,
+                        sz    = sz,
+                        name  = n,
+                    }
+                end
+            end
+            local cn = obj.ClassName
+            if cn=="Model" or cn=="Folder" or cn=="Part" or
+               cn=="UnionOperation" or cn=="MeshPart" or cn=="SpecialMesh" then
+                scan(obj, depth+1)
+            end
+        end
+    end
+    scan(workspace, 0)
+end
+
+-- Devolve a entrada de garage cujo volume contém `pos`, ou nil
+local function garageContaining(pos)
+    if tick()-garageCacheTS > CFG.GARAGE_TTL then doGarageScan() end
+    for _, g in ipairs(garageCache) do
+        local ok, lp = pcall(function() return g.cf:PointToObjectSpace(pos) end)
+        if ok and lp then
+            local hx, hy, hz = g.sz.X/2, g.sz.Y/2, g.sz.Z/2
+            if math.abs(lp.X) <= hx+1 and
+               lp.Y >= -(hy+1) and lp.Y <= hy+2 and
+               math.abs(lp.Z) <= hz+1 then
+                return g
+            end
+        end
+    end
+    return nil
+end
+
+-- ================================================================
+-- SCAN DE WORKSPACE — DIMENSÕES
+-- ================================================================
+local dimCache   = {}
+local dimCacheTS = -999
+
+local DPAT = {"dimension","dim","world","realm","zone","region","universe","plane","sector","area"}
+
+local function nameHitsDim(n)
+    local low = n:lower()
+    for _, p in ipairs(DPAT) do
+        if low:find(p, 1, true) then return true end
+    end
+    return false
+end
+
+local function doDimScan()
+    dimCache   = {}
+    dimCacheTS = tick()
+    local function scan(node, depth)
+        if depth > 4 then return end
+        local ok, kids = pcall(function() return node:GetChildren() end)
+        if not ok then return end
+        for _, obj in ipairs(kids) do
+            local n = safeRead(obj,"Name") or ""
+            if nameHitsDim(n) then
+                local cf, sz = getModelBB(obj)
+                if cf then
+                    dimCache[#dimCache+1] = { name=n, cf=cf, sz=sz }
+                end
+            end
+            local cn = obj.ClassName
+            if cn=="Model" or cn=="Folder" then scan(obj, depth+1) end
+        end
+    end
+    scan(workspace, 0)
+end
+
+-- ================================================================
+-- LEITURA DE DIMENSÃO VIA INTERFACE / ATRIBUTOS
+-- (Portal Sandbox às vezes expõe via atributos ou BillboardGui)
+-- ================================================================
+local function readDimFromPlayerAttrs(player)
+    local ATTRS = {"Dimension","DimensionId","CurrentDimension","World","Zone","Realm"}
+    for _, a in ipairs(ATTRS) do
+        local ok, v = pcall(function() return player:GetAttribute(a) end)
+        if ok and v and tostring(v)~="" then return tostring(v) end
+    end
+    local char = safeRead(player,"Character")
+    if char then
+        for _, a in ipairs(ATTRS) do
+            local ok, v = pcall(function() return char:GetAttribute(a) end)
+            if ok and v and tostring(v)~="" then return tostring(v) end
+        end
+        -- Procura StringValue/IntValue no personagem
+        local ok2, kids = pcall(function() return char:GetChildren() end)
+        if ok2 then
+            for _, c in ipairs(kids) do
+                local low = c.Name:lower()
+                if (low=="dimension" or low=="dim" or low=="world" or low=="zone") then
+                    local ok3, v = pcall(function() return tostring(c.Value) end)
+                    if ok3 and v and v~="" and v~="0" then return v end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- ================================================================
+-- FUNÇÃO: GetPlayerCharacter(player)
+-- ================================================================
+local function GetPlayerCharacter(player)
+    local char = safeRead(player, "Character")
+    if not char then return nil, "NO_CHAR" end
+    local hrp = safeRead(char, "HumanoidRootPart")
+    if not hrp  then return nil, "NO_HRP"  end
+    local hum = safeRead(char, "Humanoid")
+    if not hum  then return nil, "NO_HUM"  end
+    return char, hrp, hum
+end
+
+-- ================================================================
+-- FUNÇÃO: GetPlayerPosition(player)
+-- Retorna Vector3 ou nil + string de erro
+-- ================================================================
+local function GetPlayerPosition(player)
+    local char, hrp, hum = GetPlayerCharacter(player)
+    if not char then return nil, hrp end   -- hrp é a msg de erro aqui
+    local ok, pos = pcall(function() return hrp.Position end)
+    if not ok or not pos then return nil, "NO_POS" end
+    return pos, nil
+end
+
+-- ================================================================
+-- FUNÇÃO: GetPlayerDistance(player)
+-- Distância entre o jogador monitorado e o LocalPlayer
+-- ================================================================
+local function GetPlayerDistance(player)
+    if player == LocalPlayer then return 0, nil end
+    local pos, err = GetPlayerPosition(player)
+    if not pos then return nil, err end
+    local localPos, localErr = GetPlayerPosition(LocalPlayer)
+    if not localPos then return nil, "LOCAL_UNAVAIL" end
+    return (pos - localPos).Magnitude, nil
+end
+
+-- ================================================================
+-- FUNÇÃO: GetGarageStatus(player)
+-- ================================================================
+local function GetGarageStatus(player)
+    local pos, err = GetPlayerPosition(player)
+    if not pos then return "UNAVAILABLE", nil, nil end
+
+    -- Re-scan se o cache estiver expirado
+    if tick()-garageCacheTS > CFG.GARAGE_TTL then doGarageScan() end
+
+    -- Se não há nenhuma garagem detectada no workspace, honestamente UNKNOWN
+    if #garageCache == 0 then return "UNKNOWN", nil, nil end
+
+    local g = garageContaining(pos)
+    if not g then
+        return "OUTSIDE", nil, nil
+    end
+
+    -- Dentro de alguma garagem — verificar se é a do próprio jogador
+    local owner = g.owner
+    if not owner then
+        -- Sem informação de dono: dentro de uma garagem, dono desconhecido
+        return "UNKNOWN", g.name, nil
+    end
+
+    -- Compara com nome e displayName
+    local isOwn = (owner == player.Name) or (owner == player.DisplayName)
+    if isOwn then
+        return "IN GARAGE", g.name, owner
+    else
+        return "OUTSIDE", g.name, owner
+    end
+end
+
+-- ================================================================
+-- FUNÇÃO: GetPlayerDimension(player)
+-- ================================================================
+local function GetPlayerDimension(player)
+    -- 1) Atributos do Player / Character (mais confiável quando disponível)
+    local fromAttr = readDimFromPlayerAttrs(player)
+    if fromAttr then return fromAttr end
+
+    -- 2) Verificação espacial: o personagem está dentro de algum volume de dimensão?
+    local pos, _ = GetPlayerPosition(player)
+    if pos then
+        if tick()-dimCacheTS > CFG.DIM_TTL then doDimScan() end
+        for _, d in ipairs(dimCache) do
+            local ok, lp = pcall(function() return d.cf:PointToObjectSpace(pos) end)
+            if ok and lp then
+                local hx, hy, hz = d.sz.X/2, d.sz.Y/2, d.sz.Z/2
+                if math.abs(lp.X)<=hx and lp.Y>=-hy and
+                   lp.Y<=hy and math.abs(lp.Z)<=hz then
+                    return d.name
+                end
+            end
+        end
+        -- 3) Heurística de altitude como último recurso (documentada como heurística)
+        if pos.Y > 5000  then return "HighDim(Y>"..math.floor(pos.Y)..")" end
+        if pos.Y < -5000 then return "LowDim(Y<"..math.floor(pos.Y)..")"  end
+    end
+
+    return "UNKNOWN"
+end
+
+-- ================================================================
+-- FUNÇÃO: GetPlayerVisibility(player)
+-- ================================================================
+local function GetPlayerVisibility(player)
+    local char = safeRead(player, "Character")
+    if not char then return "UNAVAILABLE" end
+
+    local hrp = safeRead(char, "HumanoidRootPart")
+    if not hrp then return "UNAVAILABLE" end
+
+    local ok, pos = pcall(function() return hrp.Position end)
+    if not ok or not pos then return "UNAVAILABLE" end
+
+    -- Verifica transparência do HRP
+    local trans = safeRead(hrp, "Transparency")
+    if trans and trans >= 1 then return "NOT VISIBLE" end
+
+    -- Verifica se o personagem está no frustum da câmera
+    local ok2, _, onScreen = pcall(function()
+        return Camera:WorldToScreenPoint(pos)
+    end)
+    if ok2 then
+        return onScreen and "VISIBLE" or "NOT VISIBLE"
+    end
+
+    return "UNAVAILABLE"
+end
+
+-- ================================================================
+-- REGISTRY — DADOS INDIVIDUAIS
+-- ================================================================
+local function newRecord(player)
+    return {
+        player       = player,
+        name         = player.Name,
+        garageStatus = "LOADING",
+        garageName   = "?",
+        garageOwner  = "?",
+        dimension    = "LOADING",
+        position     = nil,
+        distance     = nil,
+        visibility   = "LOADING",
+        updated      = "--:--",
+    }
+end
+
+-- ================================================================
+-- FUNÇÃO: UpdatePlayerEntry(player)
+-- Atualiza o registro do jogador chamando cada método
+-- ================================================================
+local function UpdatePlayerEntry(player)
+    local uid = player.UserId
+    local rec = registry[uid]
+    if not rec then return end
+
+    -- Posição
+    local pos, posErr = GetPlayerPosition(player)
+    rec.position = pos
+
+    if not pos then
+        rec.garageStatus = "UNAVAILABLE"
+        rec.dimension    = "UNAVAILABLE"
+        rec.visibility   = "UNAVAILABLE"
+        rec.distance     = nil
+        rec.updated      = ts()
+        return
+    end
+
+    -- Distância
+    local dist, _ = GetPlayerDistance(player)
+    rec.distance = dist
+
+    -- Garagem
+    local gs, gname, gowner = GetGarageStatus(player)
+    rec.garageStatus = gs
+    rec.garageName   = gname  or "?"
+    rec.garageOwner  = gowner or "?"
+
+    -- Dimensão
+    rec.dimension = GetPlayerDimension(player)
+
+    -- Visibilidade
+    rec.visibility = GetPlayerVisibility(player)
+
+    rec.updated = ts()
+end
+
+-- ================================================================
+-- INTERFACE COMPACTA
+-- ================================================================
+local function killOldGui()
+    local g1 = PlayerGui:FindFirstChild(CFG.GUI_NAME)
+    if g1 then g1:Destroy() end
+    local g2 = PlayerGui:FindFirstChild(CFG.FAB_NAME)
+    if g2 then g2:Destroy() end
+end
+
+-- Cria botão básico
+local function mkBtn(parent, txt, bgCol, w, h)
+    local b = Instance.new("TextButton")
+    b.Size             = UDim2.new(0, w or CFG.BTN_W, 0, h or CFG.BTN_H)
+    b.BackgroundColor3 = bgCol
+    b.Text             = txt
+    b.TextColor3       = K.WHITE
+    b.Font             = Enum.Font.GothamBold
+    b.TextSize         = IS_MOBILE and 13 or 10
+    b.BorderSizePixel  = 0
+    b.AutoButtonColor  = true
+    b.ZIndex           = 8
+    b.Parent           = parent
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0,5)
+    c.Parent = b
+    return b
+end
+
+-- Botão flutuante (FAB) quando minimizado
+local function buildFAB(onReopen)
+    local fg = Instance.new("ScreenGui")
+    fg.Name           = CFG.FAB_NAME
+    fg.ResetOnSpawn   = false
+    fg.IgnoreGuiInset = true
+    fg.DisplayOrder   = 110
+    fg.Parent         = PlayerGui
+    fabGui = fg
+
+    local fab = Instance.new("TextButton")
+    fab.Size             = UDim2.new(0, CFG.FAB, 0, CFG.FAB)
+    fab.Position         = UDim2.new(0, 8, 0.5, -CFG.FAB/2)
+    fab.BackgroundColor3 = K.FAB
+    fab.Text             = "⬡"
+    fab.TextColor3       = K.WHITE
+    fab.Font             = Enum.Font.GothamBold
+    fab.TextSize         = IS_MOBILE and 20 or 14
+    fab.BorderSizePixel  = 0
+    fab.ZIndex           = 10
+    fab.Parent           = fg
+    local co = Instance.new("UICorner")
+    co.CornerRadius = UDim.new(1,0)
+    co.Parent = fab
+
+    -- Arrastar FAB
+    local drag, ds, sp = false, nil, nil
+    fab.InputBegan:Connect(function(inp)
+        if inp.UserInputType==Enum.UserInputType.Touch or
+           inp.UserInputType==Enum.UserInputType.MouseButton1 then
+            drag=true; ds=inp.Position; sp=fab.Position
+        end
+    end)
+    fab.InputEnded:Connect(function(inp)
+        if inp.UserInputType==Enum.UserInputType.Touch or
+           inp.UserInputType==Enum.UserInputType.MouseButton1 then
+            drag=false
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(inp)
+        if drag and (inp.UserInputType==Enum.UserInputType.Touch or
+           inp.UserInputType==Enum.UserInputType.MouseMovement) then
+            local d = inp.Position-ds
+            fab.Position = UDim2.new(0,sp.X.Offset+d.X, 0,sp.Y.Offset+d.Y)
+        end
+    end)
+
+    fab.Activated:Connect(function()
+        onReopen()
+        fg:Destroy()
+        fabGui = nil
+    end)
+end
+
+-- ================================================================
+-- FUNÇÃO: CreateDetectorUI()
+-- ================================================================
+local function CreateDetectorUI()
+    killOldGui()
+    rowFrames  = {}
+
+    -- ScreenGui raiz
+    screenGui = Instance.new("ScreenGui")
+    screenGui.Name           = CFG.GUI_NAME
+    screenGui.ResetOnSpawn   = false
+    screenGui.IgnoreGuiInset = true
+    screenGui.DisplayOrder   = 100
+    screenGui.Parent         = PlayerGui
+    guiAlive = true
+
+    -- Janela principal
+    mainWin = Instance.new("Frame")
+    mainWin.Name             = "Win"
+    mainWin.Size             = UDim2.new(0, CFG.WIN_W, 0, CFG.WIN_MAX_H)
+    mainWin.Position         = UDim2.new(0, 10, 0, 10)
+    mainWin.BackgroundColor3 = K.BG
+    mainWin.BorderSizePixel  = 0
+    mainWin.Active           = true
+    mainWin.ClipsDescendants = true
+    mainWin.ZIndex           = 2
+    mainWin.Parent           = screenGui
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0,8)
+        c.Parent = mainWin
+        local s = Instance.new("UIStroke")
+        s.Color = K.BORDER; s.Thickness = 1
+        s.Parent = mainWin
+    end
+
+    -- ── CABEÇALHO ────────────────────────────────────────────
+    local hdr = Instance.new("Frame")
+    hdr.Name             = "Hdr"
+    hdr.Size             = UDim2.new(1,0,0,CFG.HDR_H)
+    hdr.BackgroundColor3 = K.HDR
+    hdr.BorderSizePixel  = 0
+    hdr.ZIndex           = 3
+    hdr.Parent           = mainWin
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0,8)
+        c.Parent = hdr
+    end
+
+    -- Título + contagem
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.Size              = UDim2.new(1, -(CFG.BTN_W*2+14), 1, 0)
+    titleLbl.Position          = UDim2.new(0, 7, 0, 0)
+    titleLbl.BackgroundTransparency = 1
+    titleLbl.TextColor3        = K.TITLE
+    titleLbl.Font              = Enum.Font.GothamBold
+    titleLbl.TextSize          = CFG.FONT_HDR
+    titleLbl.TextXAlignment    = Enum.TextXAlignment.Left
+    titleLbl.Text              = "⬡ GARAGE DETECTOR"
+    titleLbl.ZIndex            = 4
+    titleLbl.Parent            = hdr
+
+    lblCount = Instance.new("TextLabel")
+    lblCount.Size              = UDim2.new(0, 40, 1, 0)
+    lblCount.Position          = UDim2.new(1, -(CFG.BTN_W*2+58), 0, 0)
+    lblCount.BackgroundTransparency = 1
+    lblCount.TextColor3        = K.CYAN
+    lblCount.Font              = Enum.Font.Gotham
+    lblCount.TextSize          = CFG.FONT_HDR - 1
+    lblCount.TextXAlignment    = Enum.TextXAlignment.Right
+    lblCount.Text              = "0p"
+    lblCount.ZIndex            = 4
+    lblCount.Parent            = hdr
+
+    -- Botões
+    local btnMini  = mkBtn(hdr, "─", K.MINI)
+    local btnClose = mkBtn(hdr, "✕", K.CLOSE)
+    btnClose.Position = UDim2.new(1, -(CFG.BTN_W+4), 0.5, -CFG.BTN_H/2)
+    btnMini.Position  = UDim2.new(1, -(CFG.BTN_W*2+8), 0.5, -CFG.BTN_H/2)
+
+    -- ── SCROLL AREA ──────────────────────────────────────────
+    local topOff = CFG.HDR_H + 1
+
+    scrollFrame = Instance.new("ScrollingFrame")
+    scrollFrame.Name                  = "Scroll"
+    scrollFrame.Size                  = UDim2.new(1,0,1,-topOff)
+    scrollFrame.Position              = UDim2.new(0,0,0,topOff)
+    scrollFrame.BackgroundTransparency = 1
+    scrollFrame.BorderSizePixel       = 0
+    scrollFrame.ScrollBarThickness    = CFG.SCROLL_BAR
+    scrollFrame.ScrollBarImageColor3  = K.PURPLE
+    scrollFrame.AutomaticCanvasSize   = Enum.AutomaticSize.Y
+    scrollFrame.CanvasSize            = UDim2.new(0,0,0,0)
+    scrollFrame.ZIndex                = 3
+    scrollFrame.Parent                = mainWin
+
+    rowLayout = Instance.new("UIListLayout")
+    rowLayout.SortOrder = Enum.SortOrder.Name
+    rowLayout.Padding   = UDim.new(0, 1)
+    rowLayout.Parent    = scrollFrame
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingLeft  = UDim.new(0, CFG.PAD)
+    pad.PaddingRight = UDim.new(0, CFG.PAD)
+    pad.PaddingTop   = UDim.new(0, CFG.PAD)
+    pad.Parent       = scrollFrame
+
+    -- Auto-resize altura da janela conforme conteúdo
+    rowLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        local contentH = rowLayout.AbsoluteContentSize.Y + CFG.PAD*2
+        local newH = math.min(topOff + contentH, CFG.WIN_MAX_H)
+        newH = math.max(newH, topOff + 10)
+        mainWin.Size = UDim2.new(0, CFG.WIN_W, 0, newH)
+    end)
+
+    -- ── DRAG ─────────────────────────────────────────────────
+    do
+        local drag, ds, sp = false, nil, nil
+        hdr.InputBegan:Connect(function(inp)
+            if inp.UserInputType==Enum.UserInputType.Touch or
+               inp.UserInputType==Enum.UserInputType.MouseButton1 then
+                drag=true; ds=inp.Position; sp=mainWin.Position
+            end
+        end)
+        hdr.InputEnded:Connect(function(inp)
+            if inp.UserInputType==Enum.UserInputType.Touch or
+               inp.UserInputType==Enum.UserInputType.MouseButton1 then
+                drag=false
+            end
+        end)
+        local dc = UserInputService.InputChanged:Connect(function(inp)
+            if drag and (inp.UserInputType==Enum.UserInputType.Touch or
+               inp.UserInputType==Enum.UserInputType.MouseMovement) then
+                local d = inp.Position-ds
+                local vp = Camera.ViewportSize
+                local nx = math.clamp(sp.X.Offset+d.X, 0, vp.X-CFG.WIN_W)
+                local ny = math.clamp(sp.Y.Offset+d.Y, 0, vp.Y-CFG.HDR_H)
+                mainWin.Position = UDim2.new(0,nx,0,ny)
+            end
+        end)
+        conns[#conns+1] = dc
+    end
+
+    -- ── MINIMIZAR ────────────────────────────────────────────
+    btnMini.Activated:Connect(function()
+        minimized = true
+        mainWin.Visible = false
+        buildFAB(function()
+            minimized = false
+            mainWin.Visible = true
+        end)
+    end)
+
+    -- ── FECHAR ───────────────────────────────────────────────
+    btnClose.Activated:Connect(function()
+        guiAlive = false
+        for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+        for _, c in pairs(charConns) do pcall(function() c:Disconnect() end) end
+        conns     = {}
+        charConns = {}
+        registry  = {}
+        rowFrames = {}
+        screenGui:Destroy()
+        if fabGui then fabGui:Destroy(); fabGui=nil end
+    end)
+end
+
+-- ================================================================
+-- FUNÇÃO: CreatePlayerEntry(player)
+-- Cria a linha na UI para um jogador
+-- ================================================================
+local function CreatePlayerEntry(player)
+    if not scrollFrame then return end
+    local uid = player.UserId
+    if rowFrames[uid] then return end   -- já existe
+
+    local altBg = (#rowFrames % 2 == 0) and K.ROW or K.ROW2
+
+    local row = Instance.new("Frame")
+    row.Name             = string.format("%010d", uid)  -- SortOrder numérico
+    row.Size             = UDim2.new(1, 0, 0, CFG.ROW_H)
+    row.BackgroundColor3 = altBg
+    row.BorderSizePixel  = 0
+    row.ZIndex           = 4
+    row.Parent           = scrollFrame
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0,4)
+        c.Parent = row
+    end
+
+    local lbls = {}
+
+    if IS_MOBILE then
+        -- Linha 1: nome  |  status garagem (direita)
+        local function mkL(nm, xS, wS, yO, hO, col, fnt, align)
+            local l = Instance.new("TextLabel")
+            l.Name              = nm
+            l.Size              = UDim2.new(wS,-2,0,hO)
+            l.Position          = UDim2.new(xS,2,0,yO)
+            l.BackgroundTransparency = 1
+            l.TextColor3        = col
+            l.Font              = fnt or Enum.Font.Gotham
+            l.TextSize          = CFG.FONT_ROW
+            l.TextXAlignment    = align or Enum.TextXAlignment.Left
+            l.TextTruncate      = Enum.TextTruncate.AtEnd
+            l.ZIndex            = 5
+            l.Parent            = row
+            return l
+        end
+        local h1 = math.floor(CFG.ROW_H*0.48)
+        local h2 = CFG.ROW_H - h1 - 2
+        lbls.name         = mkL("name",        0,   0.52, 1,    h1, K.WHITE,  Enum.Font.GothamBold)
+        lbls.garageStatus = mkL("garageStatus",0.52,0.48, 1,    h1, K.YELLOW, nil, Enum.TextXAlignment.Right)
+        lbls.dimension    = mkL("dimension",   0,   0.30, h1+2, h2, K.PURPLE)
+        lbls.position     = mkL("position",    0.30,0.38, h1+2, h2, K.CYAN)
+        lbls.distance     = mkL("distance",    0.68,0.18, h1+2, h2, K.GRAY)
+        lbls.visibility   = mkL("visibility",  0.86,0.14, h1+2, h2, K.GRAY)
+    else
+        -- Layout PC: 6 colunas inline
+        -- name | garage | dim | pos | dist | vis
+        local COL = {
+            {nm="name",        w=0.20, col=K.WHITE,  fnt=Enum.Font.GothamBold},
+            {nm="garageStatus",w=0.16, col=K.YELLOW},
+            {nm="dimension",   w=0.14, col=K.PURPLE},
+            {nm="position",    w=0.26, col=K.CYAN},
+            {nm="distance",    w=0.12, col=K.GRAY},
+            {nm="visibility",  w=0.12, col=K.GRAY},
+        }
+        local xAcc = 0
+        for _, col in ipairs(COL) do
+            local l = Instance.new("TextLabel")
+            l.Name              = col.nm
+            l.Size              = UDim2.new(col.w, -2, 1, 0)
+            l.Position          = UDim2.new(xAcc, 2, 0, 0)
+            l.BackgroundTransparency = 1
+            l.TextColor3        = col.col
+            l.Font              = col.fnt or Enum.Font.Gotham
+            l.TextSize          = CFG.FONT_ROW
+            l.TextXAlignment    = Enum.TextXAlignment.Left
+            l.TextTruncate      = Enum.TextTruncate.AtEnd
+            l.ZIndex            = 5
+            l.Parent            = row
+            lbls[col.nm] = l
+            xAcc = xAcc + col.w
+        end
+    end
+
+    rowFrames[uid] = { frame=row, labels=lbls }
+end
+
+-- ================================================================
+-- FUNÇÃO: UpdatePlayerEntry(player) — atualiza linha na UI
+-- (a lógica de dados fica em UpdatePlayerEntry acima;
+--  esta seção apenas escreve os valores na UI)
+-- ================================================================
+local function RenderPlayerEntry(player)
+    local uid = player.UserId
+    local rec = registry[uid]
+    if not rec then return end
+    local rf = rowFrames[uid]
+    if not rf then CreatePlayerEntry(player); rf = rowFrames[uid] end
+    if not rf then return end
+
+    local lbls = rf.labels
+
+    -- Cores por estado
+    local gsCol = K.YELLOW
+    if rec.garageStatus == "IN GARAGE"   then gsCol = K.GREEN
+    elseif rec.garageStatus == "OUTSIDE" then gsCol = K.RED
+    elseif rec.garageStatus == "UNAVAILABLE" then gsCol = K.GRAY
+    end
+
+    local dimCol = (rec.dimension=="UNKNOWN" or rec.dimension=="UNAVAILABLE")
+        and K.GRAY or K.PURPLE
+
+    local visCol = K.GRAY
+    if rec.visibility=="VISIBLE" then visCol = K.GREEN
+    elseif rec.visibility=="NOT VISIBLE" then visCol = K.YELLOW
+    end
+
+    -- Nome
+    if lbls.name then
+        lbls.name.Text = rec.name:sub(1, IS_MOBILE and 14 or 18)
+    end
+
+    -- Garage status
+    if lbls.garageStatus then
+        lbls.garageStatus.Text       = rec.garageStatus
+        lbls.garageStatus.TextColor3 = gsCol
+    end
+
+    -- Dimensão
+    if lbls.dimension then
+        local ds = rec.dimension:sub(1, IS_MOBILE and 10 or 14)
+        lbls.dimension.Text       = ds
+        lbls.dimension.TextColor3 = dimCol
+    end
+
+    -- Posição
+    if lbls.position then
+        lbls.position.Text = rec.position and fmtXZ(rec.position) or "N/A"
+    end
+
+    -- Distância
+    if lbls.distance then
+        lbls.distance.Text = rec.distance and (fmtDist(rec.distance).."s") or "?"
+    end
+
+    -- Visibilidade
+    if lbls.visibility then
+        local vs = rec.visibility
+        if vs=="NOT VISIBLE" then vs = "NVIS"
+        elseif vs=="UNAVAILABLE" then vs = "N/A"
+        elseif vs=="VISIBLE" then vs = "VIS" end
+        lbls.visibility.Text       = vs
+        lbls.visibility.TextColor3 = visCol
+    end
+end
+
+-- ================================================================
+-- FUNÇÃO: RemovePlayerEntry(player)
+-- ================================================================
+local function RemovePlayerEntry(player)
+    local uid = player.UserId
+    if rowFrames[uid] then
+        pcall(function() rowFrames[uid].frame:Destroy() end)
+        rowFrames[uid] = nil
+    end
+    registry[uid] = nil
+    -- Desconecta evento CharacterAdded individual
+    if charConns[uid] then
+        pcall(function() charConns[uid]:Disconnect() end)
+        charConns[uid] = nil
+    end
+end
+
+-- ================================================================
+-- FUNÇÃO: RefreshPlayerList()
+-- Sincroniza registry/UI com Players:GetPlayers()
+-- ================================================================
+local function RefreshPlayerList()
+    local current = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        current[p.UserId] = p
+        if not registry[p.UserId] then
+            registry[p.UserId] = newRecord(p)
+            CreatePlayerEntry(p)
+        end
+    end
+    -- Remove saídos
+    for uid in pairs(registry) do
+        if not current[uid] then
+            local rec = registry[uid]
+            if rec then RemovePlayerEntry(rec.player) end
+        end
+    end
+    -- Atualiza contagem
+    local n = 0
+    for _ in pairs(registry) do n=n+1 end
+    if lblCount then lblCount.Text = n.."p" end
+end
+
+-- ================================================================
+-- FUNÇÃO: UpdateDetector()
+-- Ciclo central de atualização
+-- ================================================================
+local function UpdateDetector()
+    -- Percorre todos os jogadores registrados
+    for uid, rec in pairs(registry) do
+        local ok, err = pcall(function()
+            UpdatePlayerEntry(rec.player)
+            RenderPlayerEntry(rec.player)
+        end)
+        if not ok then
+            -- Falha isolada: marca como indisponível sem afetar os demais
+            rec.garageStatus = "UNAVAILABLE"
+            rec.dimension    = "UNAVAILABLE"
+            rec.visibility   = "UNAVAILABLE"
+            rec.updated      = ts()
+            pcall(function() RenderPlayerEntry(rec.player) end)
+        end
+    end
+end
+
+-- ================================================================
+-- EVENTOS DE JOGADORES
+-- ================================================================
+local function hookCharacter(player)
+    local uid = player.UserId
+    -- Desconecta hook anterior se existir
+    if charConns[uid] then
+        pcall(function() charConns[uid]:Disconnect() end)
+    end
+    local c = player.CharacterAdded:Connect(function(_char)
+        -- Respawn: reseta o registro do jogador para LOADING
+        local rec = registry[uid]
+        if rec then
+            rec.garageStatus = "LOADING"
+            rec.dimension    = "LOADING"
+            rec.visibility   = "LOADING"
+            rec.position     = nil
+            rec.distance     = nil
+        end
+    end)
+    charConns[uid] = c
+end
+
+local function onPlayerAdded(player)
+    registry[player.UserId] = newRecord(player)
+    CreatePlayerEntry(player)
+    hookCharacter(player)
+    -- Atualiza contagem imediatamente
+    local n = 0
+    for _ in pairs(registry) do n=n+1 end
+    if lblCount then lblCount.Text = n.."p" end
+end
+
+local function onPlayerRemoving(player)
+    RemovePlayerEntry(player)
+    local n = 0
+    for _ in pairs(registry) do n=n+1 end
+    if lblCount then lblCount.Text = n.."p" end
+end
+
+-- ================================================================
+-- LOOP PRINCIPAL
+-- ================================================================
+local function mainLoop()
+    while guiAlive do
+        task.wait(CFG.UPDATE_HZ)
+        if not guiAlive then break end
+        if minimized then continue end
+        if not screenGui or not screenGui.Parent then
+            guiAlive = false; break
+        end
+        RefreshPlayerList()
+        UpdateDetector()
+    end
+end
+
+-- ================================================================
+-- ENTRADA
+-- ================================================================
+local function init()
+    -- Cria interface
+    CreateDetectorUI()
+
+    -- Registra jogadores já presentes
+    for _, p in ipairs(Players:GetPlayers()) do
+        onPlayerAdded(p)
+    end
+
+    -- Eventos globais
+    local c1 = Players.PlayerAdded:Connect(onPlayerAdded)
+    local c2 = Players.PlayerRemoving:Connect(onPlayerRemoving)
+    conns[#conns+1] = c1
+    conns[#conns+1] = c2
+
+    -- Scans iniciais em background
+    task.spawn(doGarageScan)
+    task.spawn(doDimScan)
+
+    -- Loop principal
+    task.spawn(mainLoop)
+
+    local plat = IS_MOBILE and "MOBILE" or "PC"
+    print("[GarageDetector v3] OK | "..plat.." | jogadores: "..#Players:GetPlayers())
+end
+
+local ok, err = pcall(init)
+if not ok then
+    warn("[GarageDetector v3] ERRO INIT: "..tostring(err))
+end
