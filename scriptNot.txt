@@ -1,0 +1,858 @@
+-- ══════════════════════════════════════════════════════════════
+-- PORTAL DIMENSION TRACKER — EVIL MORTY TERMINAL v3.0
+-- Client-side · Delta Executor · Mobile-optimized
+-- ══════════════════════════════════════════════════════════════
+
+local Players = game:GetService("Players")
+local LP      = Players.LocalPlayer
+local Camera  = workspace.CurrentCamera
+
+-- ─────────────────────────── PALETTE ──────────────────────────
+local C = {
+    bg     = Color3.fromRGB(5,  5,  7),
+    bgRow  = Color3.fromRGB(11, 10, 2),
+    bgHdr  = Color3.fromRGB(14, 11, 0),
+    bgTab  = Color3.fromRGB(10,  8, 0),
+    border = Color3.fromRGB(85, 68, 0),
+    amber  = Color3.fromRGB(255,195,  0),
+    ambDim = Color3.fromRGB(140,110,  0),
+    ambLo  = Color3.fromRGB(55,  44,  0),
+    white  = Color3.fromRGB(230,220,170),
+    green  = Color3.fromRGB(80, 235,100),
+    red    = Color3.fromRGB(235, 65, 55),
+    blue   = Color3.fromRGB(100,190,255),
+    cyan   = Color3.fromRGB(80, 220,200),
+    orange = Color3.fromRGB(255,140,  0),
+    gray   = Color3.fromRGB(85,  85, 95),
+}
+
+local function sColor(s)
+    if s=="CONFIRMED"      then return C.green  end
+    if s=="OBSERVED"       then return C.amber  end
+    if s=="LAST KNOWN"     then return C.ambDim end
+    if s=="NOT REPLICATED" then return C.gray   end
+    if s=="CONFLICT"       then return C.red    end
+    if s=="IN GARAGE"      then return C.green  end
+    if s=="OUTSIDE"        then return C.orange end
+    if s=="VISIBLE"        then return C.blue   end
+    if s=="NOT VISIBLE"    then return C.gray   end
+    return C.ambLo
+end
+
+-- ─────────────────────────── LAYOUT ───────────────────────────
+local ROW_H = 34
+local HDR_H = 40
+local TAB_H = 30
+local MAX_V = 7
+local FONT  = Enum.Font.Code
+
+-- column layout (fits 350px+ width)
+local COL_X = { 8,  112, 200, 288 }
+local COL_W = { 100, 84,  84,  52 }
+
+-- ─────────────────────────── STATE ────────────────────────────
+local pData    = {}
+local pgIds    = {}
+local garCache = {}
+local evLog    = {}
+local conns    = {}
+local running  = true
+
+local selUid    = nil
+local activeTab = "PLAYERS"
+local minimized = false
+local cornerIdx = 3   -- default: bottom-left
+
+local SG, mainFrame
+local scrollPlayers, tabContent
+local detailLabels = {}
+local logScroll
+local tabFrames    = {}
+
+-- ─────────────────────────── UI HELPERS ───────────────────────
+local function corner(p, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 4)
+    c.Parent = p
+end
+
+local function stroke(p, col, t)
+    local s = Instance.new("UIStroke")
+    s.Color     = col or C.border
+    s.Thickness = t or 1
+    s.Parent    = p
+end
+
+local function fr(parent, size, pos, bg)
+    local f = Instance.new("Frame")
+    f.Size             = size
+    f.Position         = pos or UDim2.new(0,0,0,0)
+    f.BackgroundColor3 = bg or C.bg
+    f.BorderSizePixel  = 0
+    f.Parent           = parent
+    return f
+end
+
+local function lbl(parent, text, size, pos, color, sz, align)
+    local l = Instance.new("TextLabel")
+    l.Text               = text
+    l.Size               = size
+    l.Position           = pos or UDim2.new(0,0,0,0)
+    l.BackgroundTransparency = 1
+    l.TextColor3         = color or C.amber
+    l.Font               = FONT
+    l.TextSize           = sz or 11
+    l.TextXAlignment     = align or Enum.TextXAlignment.Left
+    l.TextYAlignment     = Enum.TextYAlignment.Center
+    l.TextTruncate       = Enum.TextTruncate.AtEnd
+    l.TextWrapped        = false
+    l.Parent             = parent
+    return l
+end
+
+local function btn(parent, text, size, pos, bg, tc, fn)
+    local b = Instance.new("TextButton")
+    b.Text             = text
+    b.Size             = size
+    b.Position         = pos or UDim2.new(0,0,0,0)
+    b.BackgroundColor3 = bg or C.bgTab
+    b.TextColor3       = tc or C.amber
+    b.Font             = FONT
+    b.TextSize         = 11
+    b.BorderSizePixel  = 0
+    b.AutoButtonColor  = false
+    b.Active           = true
+    b.Parent           = parent
+    corner(b, 3)
+    local base = bg or C.bgTab
+    b.MouseButton1Down:Connect(function() b.BackgroundColor3 = Color3.fromRGB(50,40,0) end)
+    b.MouseButton1Up:Connect(function()   b.BackgroundColor3 = base end)
+    if fn then b.MouseButton1Click:Connect(fn) end
+    return b
+end
+
+local function mkScroll(parent, size, pos)
+    local s = Instance.new("ScrollingFrame")
+    s.Size                  = size
+    s.Position              = pos or UDim2.new(0,0,0,0)
+    s.BackgroundTransparency = 1
+    s.ScrollBarThickness    = 3
+    s.ScrollBarImageColor3  = C.border
+    s.ScrollingDirection    = Enum.ScrollingDirection.Y
+    s.CanvasSize            = UDim2.new(0,0,0,0)
+    s.Parent                = parent
+    return s
+end
+
+local function vlist(parent)
+    local l = Instance.new("UIListLayout")
+    l.SortOrder = Enum.SortOrder.LayoutOrder
+    l.Padding   = UDim.new(0,2)
+    l.Parent    = parent
+    l:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        if parent and parent.Parent then
+            parent.CanvasSize = UDim2.new(0, 0, 0, l.AbsoluteContentSize.Y + 4)
+        end
+    end)
+    return l
+end
+
+-- ─────────────────────── CORNER POSITION ──────────────────────
+local function cpAdjust()
+    local vp = Camera.ViewportSize
+    local W  = math.min(360, math.max(350, vp.X - 12))
+    local H  = HDR_H + TAB_H + ROW_H * MAX_V + 4
+    local positions = {
+        UDim2.new(0, 6,         0, 6),
+        UDim2.new(0, vp.X-W-6, 0, 6),
+        UDim2.new(0, 6,         0, vp.Y-H-6),
+        UDim2.new(0, vp.X-W-6, 0, vp.Y-H-6),
+    }
+    return positions[cornerIdx], W, H
+end
+
+-- ─────────────────────── DETECTION HELPERS ────────────────────
+local function getChar(p)
+    if not p then return nil end
+    local c = p.Character
+    return (c and c.Parent) and c or nil
+end
+local function getHRP(p)
+    local c = getChar(p)
+    if not c then return nil end
+    return c:FindFirstChild("HumanoidRootPart") or c:FindFirstChildWhichIsA("BasePart")
+end
+local function getPos(p)   local h = getHRP(p); return h and h.Position or nil end
+local function getDist(p)
+    if p == LP then return 0 end
+    local a, b = getPos(p), getPos(LP)
+    return (a and b) and math.floor((a-b).Magnitude) or nil
+end
+local function logEv(text, color)
+    table.insert(evLog, 1, { t = tick(), text = text, color = color or C.ambDim })
+    if #evLog > 200 then table.remove(evLog) end
+end
+
+-- ─────────────────────── PORTAL GUN ID ────────────────────────
+local PG_PAT = "^([A-Za-z])%-?(%d+)$"
+
+local function parseId(raw)
+    if not raw then return nil, nil end
+    local s = tostring(raw):match("^%s*(.-)%s*$")
+    local l, n = s:match(PG_PAT)
+    if l and n then return l:upper(), tonumber(n) end
+    local lp = s:match("^([A-Za-z])")
+    local np = s:match("(%d+)")
+    return lp and lp:upper() or nil, np and tonumber(np) or nil
+end
+
+local function scanPg(player)
+    local res = {}
+    local function rec(src, raw)
+        if not raw or tostring(raw) == "" then return end
+        local s = tostring(raw); local l, n = parseId(s)
+        table.insert(res, { raw=s, letter=l, number=n, source=src })
+    end
+    for _, k in ipairs({"PortalGunId","PortalId","DimensionId","Dimension","GunCode",
+                         "PortalCode","CurrentDimension","DimCode","GarageCode","GarageId"}) do
+        local v = player:GetAttribute(k); if v then rec("PA:"..k, v) end
+    end
+    for _, v in ipairs(player:GetChildren()) do
+        if v:IsA("ValueBase") then
+            local n = v.Name:lower()
+            if n:find("portal") or n:find("gun") or n:find("dim")
+               or n:find("code") or n:find("garage") then rec("PV:"..v.Name, v.Value) end
+        end
+    end
+    local char = getChar(player)
+    if char then
+        for _, k in ipairs({"PortalGunId","DimensionId","GunCode","DimCode"}) do
+            local v = char:GetAttribute(k); if v then rec("CA:"..k, v) end
+        end
+        for _, v in ipairs(char:GetDescendants()) do
+            if v:IsA("ValueBase") then
+                local n = v.Name:lower()
+                if n:find("portal") or n:find("gun") or n:find("dim") then
+                    rec("CV:"..v.Name, v.Value)
+                end
+            end
+            if v:IsA("TextLabel") and v.Text ~= ""
+               and v.Text:match("[A-Za-z]%-?%d") then rec("CG:"..v.Name, v.Text) end
+        end
+        for _, tool in ipairs(char:GetChildren()) do
+            if tool:IsA("Tool") and tool.Name:lower():find("portal") then
+                for _, k in ipairs({"PortalGunId","DimensionId","Code","Id"}) do
+                    local v = tool:GetAttribute(k); if v then rec("TA:"..tool.Name.."."..k, v) end
+                end
+                for _, v in ipairs(tool:GetDescendants()) do
+                    if v:IsA("ValueBase") then rec("TV:"..v.Name, v.Value) end
+                    if v:IsA("TextLabel") and v.Text ~= ""
+                       and v.Text:match("[A-Za-z]%-?%d") then rec("TG:"..v.Name, v.Text) end
+                end
+            end
+        end
+    end
+    if player == LP then
+        local pg2 = LP:FindFirstChild("PlayerGui")
+        if pg2 then
+            for _, v in ipairs(pg2:GetDescendants()) do
+                if v:IsA("TextLabel") and v.Text ~= ""
+                   and v.Text:match("[A-Za-z]%-?%d") then rec("GUI:"..v.Name, v.Text) end
+            end
+        end
+    end
+    return res
+end
+
+local function updatePg(player)
+    local res = scanPg(player)
+    local best
+    for _, r in ipairs(res) do if r.letter and r.number then best = r; break end end
+    if not best and #res > 0 then best = res[1] end
+    local prev = pgIds[player.UserId]
+    pgIds[player.UserId] = best and {
+        raw=best.raw, letter=best.letter, number=best.number,
+        source=best.source, t=tick(), all=res
+    } or nil
+    if best and (not prev or prev.raw ~= best.raw) then
+        logEv("[PG] "..player.Name.." → "..best.raw, C.cyan)
+    end
+end
+
+-- ──────────────────────── DIMENSION ───────────────────────────
+local DIM_K = {"Dimension","DimensionId","CurrentDimension","DimCode",
+                "Portal","PortalId","GarageCode","World","WorldId"}
+
+local function getDim(player)
+    for _, k in ipairs(DIM_K) do
+        local v = player:GetAttribute(k)
+        if v ~= nil then return tostring(v), "PA:"..k, "OBSERVED" end
+    end
+    for _, v in ipairs(player:GetChildren()) do
+        if v:IsA("ValueBase") then
+            local n = v.Name:lower()
+            if n:find("dim") or n:find("portal") or n:find("world") or n:find("garage") then
+                return tostring(v.Value), "PV:"..v.Name, "OBSERVED"
+            end
+        end
+    end
+    local char = getChar(player)
+    if char then
+        for _, k in ipairs(DIM_K) do
+            local v = char:GetAttribute(k)
+            if v ~= nil then return tostring(v), "CA:"..k, "OBSERVED" end
+        end
+        for _, v in ipairs(char:GetDescendants()) do
+            if v:IsA("ValueBase") then
+                local n = v.Name:lower()
+                if n:find("dim") or n:find("portal") or n:find("world") then
+                    return tostring(v.Value), "CV:"..v.Name, "OBSERVED"
+                end
+            end
+        end
+        for _, gui in ipairs(char:GetDescendants()) do
+            if gui:IsA("BillboardGui") then
+                for _, l in ipairs(gui:GetDescendants()) do
+                    if l:IsA("TextLabel") and l.Text ~= "" then
+                        local t = l.Text:lower()
+                        if t:find("dim") or t:find("portal") or t:find("world") then
+                            return l.Text, "CB:"..gui.Name, "OBSERVED"
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local pg = pgIds[player.UserId]
+    if pg and pg.raw then return pg.raw, pg.source, "OBSERVED" end
+    if player == LP then
+        local gui = LP:FindFirstChild("PlayerGui")
+        if gui then
+            for _, v in ipairs(gui:GetDescendants()) do
+                if v:IsA("TextLabel") and v.Text ~= "" then
+                    local t = v.Text:lower()
+                    if t:find("dim:") or t:find("dimension") or t:find("world:") then
+                        return v.Text, "GUI:"..v.Name, "OBSERVED"
+                    end
+                end
+            end
+        end
+    end
+    return "UNKNOWN", "none", "UNKNOWN"
+end
+
+-- ─────────────────────── GARAGE (cached 5s) ───────────────────
+local function findGarage(player)
+    local now = tick()
+    local c   = garCache[player.UserId]
+    if c and (now - c.t) < 5 then return c.r end
+
+    local regions = {}
+    local uid     = tostring(player.UserId)
+    local uname   = player.Name:lower()
+
+    local function scan(model)
+        local oa = model:GetAttribute("Owner") or model:GetAttribute("OwnerId")
+                or model:GetAttribute("PlayerUserId") or model:GetAttribute("UserId")
+        local ov = model:FindFirstChild("Owner") or model:FindFirstChild("OwnerId")
+                or model:FindFirstChild("PlayerName")
+        local owned = false
+        if oa then owned = tostring(oa)==uid or tostring(oa):lower()==uname end
+        if not owned and ov and ov:IsA("ValueBase") then
+            owned = tostring(ov.Value)==uid or tostring(ov.Value):lower()==uname
+        end
+        if not owned then owned = model.Name:lower():find(uname, 1, true) ~= nil end
+        if not owned then return end
+
+        local parts = {}
+        for _, p in ipairs(model:GetDescendants()) do
+            if p:IsA("BasePart") then
+                local n = p.Name:lower()
+                if n:find("wall") or n:find("floor") or n:find("bound")
+                   or n:find("garage") or n:find("interior")
+                   or n:find("region") or n:find("volume") then
+                    table.insert(parts, p)
+                end
+            end
+        end
+        if #parts == 0 then
+            for _, p in ipairs(model:GetDescendants()) do
+                if p:IsA("BasePart") then table.insert(parts, p) end
+            end
+        end
+        if #parts == 0 then return end
+
+        local mn, mx = parts[1].Position, parts[1].Position
+        for _, p in ipairs(parts) do
+            local s = p.Size / 2
+            for dx=-1,1,2 do for dy=-1,1,2 do for dz=-1,1,2 do
+                local cr = p.CFrame * Vector3.new(s.X*dx, s.Y*dy, s.Z*dz)
+                mn = Vector3.new(math.min(mn.X,cr.X), math.min(mn.Y,cr.Y), math.min(mn.Z,cr.Z))
+                mx = Vector3.new(math.max(mx.X,cr.X), math.max(mx.Y,cr.Y), math.max(mx.Z,cr.Z))
+            end end end
+        end
+        table.insert(regions, { center=(mn+mx)/2, size=mx-mn })
+    end
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") then
+            local n = obj.Name:lower()
+            if n:find("garage") or n:find("bay") or n:find("hangar") then
+                pcall(scan, obj)
+            end
+        end
+    end
+    garCache[player.UserId] = { r=regions, t=now }
+    return regions
+end
+
+local function getGarage(player)
+    local pos = getPos(player); if not pos then return "UNKNOWN" end
+    local ok, regions = pcall(findGarage, player)
+    if not ok or not regions or #regions == 0 then return "UNKNOWN" end
+    for _, r in ipairs(regions) do
+        local h = r.size / 2
+        if math.abs(pos.X-r.center.X) <= h.X
+           and math.abs(pos.Y-r.center.Y) <= h.Y
+           and math.abs(pos.Z-r.center.Z) <= h.Z then
+            return "IN GARAGE"
+        end
+    end
+    return "OUTSIDE"
+end
+
+-- ──────────────────────── VISIBILITY ──────────────────────────
+local function getVis(player)
+    local char = getChar(player); if not char then return "NOT REPLICATED" end
+    local hrp  = char:FindFirstChild("HumanoidRootPart"); if not hrp then return "UNAVAILABLE" end
+    local vis, total = 0, 0
+    for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+            total += 1; if p.Transparency < 0.95 then vis += 1 end
+        end
+    end
+    if total > 0 and vis == 0 then return "NOT VISIBLE" end
+    local d = getDist(player); if d and d > 2000 then return "NOT VISIBLE" end
+    local cam  = Camera.CFrame.Position
+    local cpos = hrp.Position
+    local dir  = cpos - cam
+    local mag  = dir.Magnitude
+    if mag < 1 then return "VISIBLE" end
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = { char, LP.Character or {} }
+    return workspace:Raycast(cam, dir.Unit*mag, rp) and "NOT VISIBLE" or "VISIBLE"
+end
+
+-- ────────────────────────── TAB SWITCH ────────────────────────
+local function switchTab(name)
+    activeTab = name
+    for k, f in pairs(tabFrames) do if f then f.Visible = k == name end end
+end
+
+-- ─────────────────────────── MINI BADGE ───────────────────────
+local miniBadge
+local function buildBadge()
+    if miniBadge then miniBadge:Destroy() end
+    local vp = Camera.ViewportSize
+    miniBadge = fr(SG, UDim2.new(0,148,0,28), UDim2.new(0,6,0,vp.Y-34), Color3.fromRGB(8,7,0))
+    miniBadge.Visible = false
+    miniBadge.ZIndex  = 20
+    corner(miniBadge, 4); stroke(miniBadge, C.border, 1)
+    local dot = lbl(miniBadge, "●", UDim2.new(0,14,1,0), UDim2.new(0,4,0,0), C.green, 10)
+    lbl(miniBadge, "PORTAL TRACKER", UDim2.new(1,-42,1,0), UDim2.new(0,20,0,0), C.amber, 10)
+    btn(miniBadge, "▲", UDim2.new(0,24,0,22), UDim2.new(1,-28,0,3),
+        Color3.fromRGB(18,14,0), C.amber,
+        function() miniBadge.Visible=false; mainFrame.Visible=true; minimized=false end)
+    task.spawn(function()
+        while miniBadge and miniBadge.Parent do
+            dot.TextColor3 = C.green;  task.wait(0.8)
+            dot.TextColor3 = C.ambLo;  task.wait(0.4)
+        end
+    end)
+end
+
+-- ──────────────────────── PLAYERS TAB ─────────────────────────
+local function buildPlayersTab(parent)
+    local f = fr(parent, UDim2.new(1,0,1,0), nil, C.bg)
+    f.Visible = true; tabFrames["PLAYERS"] = f
+
+    local ch = fr(f, UDim2.new(1,0,0,18), nil, C.bg)
+    local names = { "PLAYER", "DIM", "STATUS", "DIST" }
+    for i = 1, 4 do
+        lbl(ch, names[i], UDim2.new(0,COL_W[i],1,0), UDim2.new(0,COL_X[i],0,0), C.ambLo, 9)
+    end
+
+    scrollPlayers = mkScroll(f, UDim2.new(1,-4,1,-20), UDim2.new(0,0,0,20))
+    vlist(scrollPlayers)
+end
+
+-- ──────────────────────── DETAIL TAB ──────────────────────────
+local function buildDetailTab(parent)
+    local f = fr(parent, UDim2.new(1,0,1,0), nil, C.bg)
+    f.Visible = false; tabFrames["DETAIL"] = f
+
+    local s = mkScroll(f, UDim2.new(1,0,1,-34))
+    vlist(s)
+
+    local rows = {
+        {"PLAYER","name"}, {"USER ID","uid"}, {"DIMENSION","dim"},
+        {"DIM LETTER","dimL"}, {"DIM NUMBER","dimN"}, {"DIM SOURCE","dimS"},
+        {"CONFIDENCE","conf"}, {"GARAGE","garage"}, {"VISIBILITY","vis"},
+        {"DISTANCE","dist"}, {"POS X","posX"}, {"POS Y","posY"}, {"POS Z","posZ"},
+        {"REPLICATED","repl"}, {"PORTAL GUN","pgid"}, {"PG LETTER","pgL"},
+        {"PG NUMBER","pgN"}, {"PG SOURCE","pgS"}, {"LAST UPDATE","upd"},
+    }
+    for i, r in ipairs(rows) do
+        local row = fr(s, UDim2.new(1,-4,0,22), UDim2.new(0,2,0,0), C.bgRow)
+        row.LayoutOrder = i; corner(row, 2)
+        lbl(row, r[1], UDim2.new(0,105,1,0), UDim2.new(0,6,0,0), C.ambDim, 9)
+        detailLabels[r[2]] = lbl(row, "—", UDim2.new(1,-112,1,0), UDim2.new(0,110,0,0), C.amber, 10)
+    end
+
+    btn(f, "← PLAYERS", UDim2.new(1,-12,0,24), UDim2.new(0,6,1,-28),
+        Color3.fromRGB(14,10,0), C.amber, function() switchTab("PLAYERS") end)
+end
+
+-- ───────────────────────── LOG TAB ────────────────────────────
+local function buildLogTab(parent)
+    local f = fr(parent, UDim2.new(1,0,1,0), nil, C.bg)
+    f.Visible = false; tabFrames["LOG"] = f
+
+    local clr = btn(f, "CLR", UDim2.new(0,34,0,16), UDim2.new(1,-38,0,2),
+        Color3.fromRGB(30,8,0), C.red, function() evLog = {} end)
+    clr.TextSize = 9
+
+    logScroll = mkScroll(f, UDim2.new(1,0,1,-20), UDim2.new(0,0,0,20))
+    vlist(logScroll)
+end
+
+-- ────────────────────────── MAIN WINDOW ───────────────────────
+local function buildUI()
+    local ex = LP:FindFirstChild("PlayerGui") and LP.PlayerGui:FindFirstChild("PDTSG")
+    if ex then ex:Destroy() end
+
+    SG = Instance.new("ScreenGui")
+    SG.Name          = "PDTSG"
+    SG.ResetOnSpawn  = false
+    SG.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    SG.DisplayOrder  = 50
+    SG.Parent        = LP.PlayerGui
+
+    local pos, W, H = cpAdjust()
+
+    mainFrame = fr(SG, UDim2.new(0,W,0,H), pos, C.bg)
+    mainFrame.Active = false   -- body passes through touch → camera still works
+    corner(mainFrame, 6); stroke(mainFrame, C.border, 1)
+
+    -- ── header ──────────────────────────────────────────────
+    local hdr = fr(mainFrame, UDim2.new(1,0,0,HDR_H), nil, C.bgHdr)
+    hdr.Active = true  -- header absorbs touch → drag won't bleed to camera
+    corner(hdr, 6)
+    fr(hdr, UDim2.new(1,0,0,8), UDim2.new(0,0,1,-8), C.bgHdr) -- square bottom corners
+
+    local blinkL = lbl(hdr, "◆", UDim2.new(0,14,0,14), UDim2.new(0,8,0,13),  C.amber, 12)
+    lbl(hdr, "PORTAL DIMENSION TRACKER",
+        UDim2.new(1,-125,0,16), UDim2.new(0,26,0,2), C.amber, 11)
+    local subL = lbl(hdr, "MULTIVERSE SCAN ACTIVE",
+        UDim2.new(1,-125,0,14), UDim2.new(0,26,0,20), C.ambDim, 9)
+
+    -- ⊕ cycle corners
+    btn(hdr, "⊕", UDim2.new(0,26,0,22), UDim2.new(1,-88,0,9),
+        Color3.fromRGB(14,11,0), C.ambDim,
+        function()
+            cornerIdx = (cornerIdx % 4) + 1
+            local np, nw, nh = cpAdjust()
+            mainFrame.Position = np
+            mainFrame.Size     = UDim2.new(0, nw, 0, nh)
+        end)
+
+    -- minimize to badge
+    btn(hdr, "▬", UDim2.new(0,26,0,22), UDim2.new(1,-58,0,9),
+        Color3.fromRGB(14,11,0), C.ambDim,
+        function()
+            minimized           = true
+            mainFrame.Visible   = false
+            if miniBadge then miniBadge.Visible = true end
+        end)
+
+    -- close
+    btn(hdr, "✕", UDim2.new(0,26,0,22), UDim2.new(1,-28,0,9),
+        Color3.fromRGB(40,8,0), C.red,
+        function()
+            running = false
+            for _, c in ipairs(conns) do pcall(c.Disconnect, c) end
+            SG:Destroy()
+        end)
+
+    -- ── drag (mobile-safe: InputObject.Changed, not global UIS) ─
+    -- Only fires when touch STARTS on the header → no camera bleed
+    hdr.InputBegan:Connect(function(input)
+        local t = input.UserInputType
+        if t ~= Enum.UserInputType.MouseButton1
+           and t ~= Enum.UserInputType.Touch then return end
+        local sx = mainFrame.AbsolutePosition.X
+        local sy = mainFrame.AbsolutePosition.Y
+        local ix = input.Position.X
+        local iy = input.Position.Y
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.Change then
+                mainFrame.Position = UDim2.new(0,
+                    sx + (input.Position.X - ix),
+                    0,
+                    sy + (input.Position.Y - iy))
+            end
+        end)
+    end)
+
+    -- blinking status task
+    task.spawn(function()
+        local i = 0
+        while mainFrame and mainFrame.Parent do
+            i += 1
+            blinkL.Text       = i%2==0 and "◆" or "◇"
+            blinkL.TextColor3 = i%2==0 and C.amber or C.ambDim
+            subL.Text         = string.format("[%d NODES SCANNED]", #Players:GetPlayers())
+            task.wait(0.7)
+        end
+    end)
+
+    -- ── tab bar ──────────────────────────────────────────────
+    local tb    = fr(mainFrame, UDim2.new(1,0,0,TAB_H), UDim2.new(0,0,0,HDR_H), C.bgTab)
+    local tdefs = { "PLAYERS", "DETAIL", "LOG" }
+    local tbtns = {}
+
+    for i, name in ipairs(tdefs) do
+        local b = btn(tb, name,
+            UDim2.new(1/3,-2, 1,-4), UDim2.new((i-1)/3, 1, 0, 2),
+            i==1 and Color3.fromRGB(22,17,0) or C.bgTab,
+            i==1 and C.amber or C.ambDim)
+        b.MouseButton1Click:Connect(function()
+            switchTab(name)
+            for _, tb2 in pairs(tbtns) do
+                tb2.TextColor3       = C.ambDim
+                tb2.BackgroundColor3 = C.bgTab
+            end
+            b.TextColor3       = C.amber
+            b.BackgroundColor3 = Color3.fromRGB(22,17,0)
+        end)
+        tbtns[name] = b
+    end
+
+    -- ── content area ─────────────────────────────────────────
+    local cH = H - HDR_H - TAB_H - 2
+    tabContent = fr(mainFrame, UDim2.new(1,0,0,cH), UDim2.new(0,0,0,HDR_H+TAB_H+2), C.bg)
+    tabContent.ClipDescendants = true
+
+    buildPlayersTab(tabContent)
+    buildDetailTab(tabContent)
+    buildLogTab(tabContent)
+    buildBadge()
+end
+
+-- ─────────────────────────── PLAYER ROWS ──────────────────────
+local function getRow(player)
+    local d = pData[player.UserId]
+    if d and d.row and d.row.Parent then return d end
+
+    local row = fr(scrollPlayers, UDim2.new(1,-4,0,ROW_H), UDim2.new(0,2,0,0), C.bgRow)
+    row.Name = "R"..player.UserId; corner(row, 2)
+
+    fr(row, UDim2.new(0,2,0.65,0), UDim2.new(0,0,0.175,0), C.ambDim) -- accent bar
+    lbl(row, player.Name,
+        UDim2.new(0,COL_W[1]-4,1,0), UDim2.new(0,COL_X[1]+4,0,0), C.white, 11)
+    local dimL  = lbl(row, "—", UDim2.new(0,COL_W[2]-4,1,0), UDim2.new(0,COL_X[2],0,0), C.ambDim, 10)
+    local statL = lbl(row, "—", UDim2.new(0,COL_W[3]-4,1,0), UDim2.new(0,COL_X[3],0,0), C.ambDim, 9)
+    local distL = lbl(row, "—", UDim2.new(0,COL_W[4],  1,0), UDim2.new(0,COL_X[4],0,0), C.ambDim, 10)
+    fr(row, UDim2.new(1,0,0,1), UDim2.new(0,0,1,-1), C.ambLo) -- separator
+
+    local tap = Instance.new("TextButton")
+    tap.Text                 = ""
+    tap.Size                 = UDim2.new(1,0,1,0)
+    tap.BackgroundTransparency = 1
+    tap.ZIndex               = 5
+    tap.Parent               = row
+    tap.MouseButton1Click:Connect(function()
+        selUid = player.UserId; switchTab("DETAIL")
+    end)
+
+    local entry = {
+        player = player, row = row,
+        dimL = dimL, statL = statL, distL = distL,
+        lastUpdate = tick(),
+    }
+    pData[player.UserId] = entry
+    return entry
+end
+
+local function updateRow(player)
+    local d = pData[player.UserId]
+    if not d or not d.row or not d.row.Parent then return end
+
+    local repl = getChar(player) ~= nil
+    local ok1, dim, src, conf = pcall(getDim,    player)
+    local ok2, dist           = pcall(getDist,   player)
+    local ok3, garage         = pcall(getGarage, player)
+    local ok4, vis            = pcall(getVis,    player)
+
+    dim    = ok1 and dim    or "UNKNOWN"
+    src    = ok1 and src    or "none"
+    conf   = ok1 and conf   or "UNKNOWN"
+    dist   = ok2 and dist   or nil
+    garage = ok3 and garage or "UNKNOWN"
+    vis    = ok4 and vis    or "UNKNOWN"
+
+    if not repl then conf = "NOT REPLICATED"; dim = d.lastDim or "UNKNOWN" end
+
+    d.dimL.Text        = (dim ~= "" and dim ~= "UNKNOWN") and dim or "—"
+    d.dimL.TextColor3  = sColor(conf)
+    d.statL.Text       = conf
+    d.statL.TextColor3 = sColor(conf)
+    d.distL.Text       = dist and dist.."m" or "—"
+
+    d.lastDim    = dim;    d.lastConf   = conf;   d.lastSrc    = src
+    d.lastGarage = garage; d.lastVis    = vis;    d.lastDist   = dist
+    d.lastPos    = repl and getPos(player) or d.lastPos
+    d.replicated = repl;   d.lastUpdate = tick()
+end
+
+
+-- ────────────────────────── DETAIL REFRESH ────────────────────
+local function refreshDetail()
+    if activeTab ~= "DETAIL" then return end
+    if not selUid then
+        for _, l in pairs(detailLabels) do l.Text = "—" end; return
+    end
+    local d  = pData[selUid]; if not d then return end
+    local pg = pgIds[selUid]; local p = d.player
+
+    local function set(k, v, color)
+        local l = detailLabels[k]; if not l then return end
+        l.Text = tostring(v or "—"); if color then l.TextColor3 = color end
+    end
+
+    local dl, dn = parseId(d.lastDim or "")
+    set("name",   p.Name,       C.white)
+    set("uid",    p.UserId,     C.ambDim)
+    set("dim",    d.lastDim,    sColor(d.lastConf))
+    set("dimL",   dl,           C.cyan)
+    set("dimN",   dn,           C.cyan)
+    set("dimS",   d.lastSrc,    C.ambLo)
+    set("conf",   d.lastConf,   sColor(d.lastConf))
+    set("garage", d.lastGarage, sColor(d.lastGarage))
+    set("vis",    d.lastVis,    sColor(d.lastVis))
+    set("dist",   d.lastDist and d.lastDist.."m" or "—")
+    set("repl",   d.replicated and "YES" or "NO", d.replicated and C.green or C.red)
+
+    if d.lastPos then
+        set("posX", string.format("%.1f", d.lastPos.X), C.ambDim)
+        set("posY", string.format("%.1f", d.lastPos.Y), C.ambDim)
+        set("posZ", string.format("%.1f", d.lastPos.Z), C.ambDim)
+    else set("posX","—"); set("posY","—"); set("posZ","—") end
+
+    if pg then
+        set("pgid", pg.raw,    C.orange)
+        set("pgL",  pg.letter, C.orange)
+        set("pgN",  pg.number, C.orange)
+        set("pgS",  pg.source, C.ambLo)
+    else set("pgid","—"); set("pgL","—"); set("pgN","—"); set("pgS","—") end
+
+    set("upd", (tick()-d.lastUpdate) < 1 and "just now"
+               or string.format("%.1fs ago", tick()-d.lastUpdate))
+end
+
+-- ─────────────────────────── LOG REFRESH ──────────────────────
+local function refreshLog()
+    if activeTab ~= "LOG" or not logScroll then return end
+    for _, c in ipairs(logScroll:GetChildren()) do
+        if c:IsA("Frame") then c:Destroy() end
+    end
+    for i = 1, math.min(#evLog, 80) do
+        local e   = evLog[i]
+        local row = fr(logScroll, UDim2.new(1,-4,0,16), UDim2.new(0,2,0,0), Color3.fromRGB(7,6,0))
+        row.LayoutOrder = i
+        lbl(row, string.format("[%.0f] %s", e.t%100000, e.text),
+            UDim2.new(1,-4,1,0), UDim2.new(0,4,0,0), e.color, 9)
+    end
+end
+
+-- ──────────────────────────── MAIN LOOP ───────────────────────
+local function startLoop()
+    task.spawn(function()
+        while running do
+            task.wait(0.5)
+            if minimized or not SG or not SG.Parent then continue end
+            pcall(function()
+                local all   = Players:GetPlayers()
+                local alive = {}
+                for _, p in ipairs(all) do alive[p.UserId] = true end
+
+                -- remove gone
+                for uid, d in pairs(pData) do
+                    if not alive[uid] then
+                        if d.row and d.row.Parent then d.row:Destroy() end
+                        pData[uid] = nil
+                    end
+                end
+
+                -- create missing rows + update data
+                for _, p in ipairs(all) do
+                    if not (pData[p.UserId] and pData[p.UserId].row
+                            and pData[p.UserId].row.Parent) then
+                        getRow(p)
+                    end
+                    pcall(updatePg,  p)
+                    pcall(updateRow, p)
+                end
+
+                if activeTab == "DETAIL" then pcall(refreshDetail) end
+                if activeTab == "LOG"    then pcall(refreshLog)    end
+            end)
+        end
+    end)
+end
+
+-- ───────────────────────────── EVENTS ─────────────────────────
+local function hookPlayer(p)
+    local c1 = p.CharacterAdded:Connect(function()
+        task.wait(0.2); pcall(updatePg, p); pcall(updateRow, p)
+        logEv("[SPAWN] "..p.Name, C.green)
+    end)
+    local c2 = p.CharacterRemoving:Connect(function()
+        logEv("[DESP] "..p.Name, C.gray)
+        local d = pData[p.UserId]
+        if d then
+            d.statL.Text       = "NOT REPLICATED"
+            d.statL.TextColor3 = C.gray
+            d.replicated       = false
+        end
+    end)
+    table.insert(conns, c1); table.insert(conns, c2)
+end
+
+-- ───────────────────────────── INIT ───────────────────────────
+buildUI()
+logEv("[SYS] PORTAL TRACKER v3.0 ONLINE",   C.amber)
+logEv("[SYS] CLIENT-SIDE — READ ONLY",       C.ambDim)
+
+for _, p in ipairs(Players:GetPlayers()) do
+    hookPlayer(p)
+    getRow(p)
+    task.spawn(updatePg,  p)
+    task.spawn(updateRow, p)
+end
+
+table.insert(conns, Players.PlayerAdded:Connect(function(p)
+    hookPlayer(p); logEv("[JOIN] "..p.Name, C.green); task.spawn(updatePg, p)
+end))
+
+table.insert(conns, Players.PlayerRemoving:Connect(function(p)
+    logEv("[LEAVE] "..p.Name, C.red)
+    task.wait(0.5)
+    local d = pData[p.UserId]
+    if d and d.row and d.row.Parent then d.row:Destroy() end
+    pData[p.UserId] = nil; garCache[p.UserId] = nil; pgIds[p.UserId] = nil
+end))
+
+startLoop()
+print("[PortalTracker v3.0] online →", #Players:GetPlayers(), "nodes")
